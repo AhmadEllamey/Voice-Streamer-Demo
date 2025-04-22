@@ -1,13 +1,27 @@
 import 'dart:async';
-import 'dart:io'; // For RawDatagramSocket, InternetAddress
-import 'dart:typed_data'; // For Uint8List
+import 'dart:io';
+import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_sound/flutter_sound.dart';
+// Import the encrypt package
+import 'package:encrypt/encrypt.dart' as encrypt; // Use prefix to avoid conflicts
 
 // Audio parameters (keep consistent)
 const int serverSampleRate = 16000;
 const int serverNumChannels = 1;
+
+// --- Encryption Setup ---
+// INSECURE: Hardcoded Pre-Shared Key (32 bytes for AES-256)
+// Use the same key string in Python!
+final String sharedKeyString = "ThisIsA_Secure32ByteKey123456780";
+// Convert the string key to Key object for the library
+final encrypt.Key encryptionKey = encrypt.Key.fromUtf8(sharedKeyString);
+// Nonce length for AES-GCM (12 bytes is standard)
+const int nonceLength = 12;
+// --- End Encryption Setup ---
+
 
 void main() {
   runApp(const MyApp());
@@ -18,7 +32,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Voice Streamer UDP (flutter_sound)',
+      title: 'Voice Streamer UDP Encrypted', // Updated title
       theme: ThemeData(primarySwatch: Colors.blue, useMaterial3: true),
       home: const VoiceStreamerPage(),
     );
@@ -34,43 +48,42 @@ class VoiceStreamerPage extends StatefulWidget {
 class _VoiceStreamerPageState extends State<VoiceStreamerPage> {
   final FlutterSoundRecorder _recorder = FlutterSoundRecorder();
   StreamSubscription? _recorderSubscription;
-  // --- UDP Changes ---
-  RawDatagramSocket? _udpSocket; // Use RawDatagramSocket for UDP
-  InternetAddress? _serverAddress; // Store resolved server address
-  int? _serverPort; // Store server port
-  // --- End UDP Changes ---
+  RawDatagramSocket? _udpSocket;
+  InternetAddress? _serverAddress;
+  int? _serverPort;
+
+  // AES-GCM Encrypter instance
+  // Initialize it once, or ensure key is available when needed
+  final encrypter = encrypt.Encrypter(encrypt.AES(encryptionKey, mode: encrypt.AESMode.gcm));
 
   bool _isStreaming = false;
   bool _isRecorderInitialized = false;
   String _statusText = "Enter Server IP/Port and press Start";
 
-  final TextEditingController _ipController =
-  TextEditingController(text: "192.168.1.53"); // Default IP
-  final TextEditingController _portController =
-  TextEditingController(text: "8080"); // Default Port (UDP)
+  final TextEditingController _ipController = TextEditingController(text: "192.168.1.53");
+  final TextEditingController _portController = TextEditingController(text: "8080");
 
   @override
   void initState() {
     super.initState();
+    // IMPORTANT: Warn about insecure key in debug mode
+    if (kDebugMode) {
+      debugPrint("***********************************************************");
+      debugPrint("WARNING: Using hardcoded encryption key for DEMO purposes.");
+      debugPrint("This is INSECURE and should NOT be used in production!");
+      debugPrint("***********************************************************");
+    }
     _openRecorderSession().then((_) {
-      setState(() {
-        _isRecorderInitialized = true;
-        _statusText = "Recorder ready. Enter Server IP/Port and press Start.";
-      });
+      setState(() { _isRecorderInitialized = true; _statusText = "Recorder ready."; });
     }).catchError((err) {
-      setState(() {
-        _statusText = "Recorder Init Error: $err";
-        _isRecorderInitialized = false;
-      });
+      setState(() { _statusText = "Recorder Init Error: $err"; _isRecorderInitialized = false; });
     });
   }
 
   @override
   void dispose() {
     _stopStreaming();
-    _recorder.closeRecorder().catchError((err) {
-      debugPrint("Error closing recorder: $err");
-    });
+    _recorder.closeRecorder().catchError((err) { debugPrint("Error closing recorder: $err"); });
     _ipController.dispose();
     _portController.dispose();
     super.dispose();
@@ -86,92 +99,62 @@ class _VoiceStreamerPageState extends State<VoiceStreamerPage> {
     debugPrint("Recorder session opened.");
   }
 
-  // --- UDP Streaming Logic ---
   Future<void> _startStreaming() async {
+    // ... (Permission checks, IP/Port parsing, IP lookup - remain the same) ...
     if (_isStreaming) return;
-    if (!_isRecorderInitialized) {
-      setState(() { _statusText = "Recorder not ready."; });
-      return;
-    }
+    if (!_isRecorderInitialized) { setState(() { _statusText = "Recorder not ready."; }); return; }
     var micStatus = await Permission.microphone.status;
-    if (!micStatus.isGranted) {
-      setState(() { _statusText = "Microphone permission needed."; });
-      return;
-    }
+    if (!micStatus.isGranted) { setState(() { _statusText = "Microphone permission needed."; }); return; }
 
     final String ipStr = _ipController.text.trim();
     final String portStr = _portController.text.trim();
     _serverPort = int.tryParse(portStr);
 
-    if (ipStr.isEmpty || _serverPort == null) {
-      setState(() { _statusText = "Invalid IP or Port"; });
-      return;
-    }
+    if (ipStr.isEmpty || _serverPort == null) { setState(() { _statusText = "Invalid IP or Port"; }); return; }
 
-    // Resolve IP address string to InternetAddress object
     try {
       var addresses = await InternetAddress.lookup(ipStr);
-      if (addresses.isEmpty) {
-        setState(() { _statusText = "Cannot resolve IP address"; });
-        return;
-      }
-      // Use the first resolved address
+      if (addresses.isEmpty) { setState(() { _statusText = "Cannot resolve IP address"; }); return; }
       _serverAddress = addresses.first;
       debugPrint('Resolved server address: ${_serverAddress?.address}');
-
-    } catch (e) {
-      setState(() { _statusText = "Error resolving IP: $e"; });
-      return;
-    }
+    } catch (e) { setState(() { _statusText = "Error resolving IP: $e"; }); return; }
 
 
-    setState(() {
-      _statusText = "Starting UDP Stream...";
-      _isStreaming = true; // Tentatively set streaming state
-    });
+    setState(() { _statusText = "Starting Encrypted UDP Stream..."; _isStreaming = true; });
 
     try {
-      // Bind the UDP socket to any available local IP and port 0 (OS chooses port)
       _udpSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
       debugPrint('UDP Socket bound to local port: ${_udpSocket?.port}');
-
-      // Optional: Listen for incoming datagrams (e.g., ACKs from server)
-      // _udpSocket?.listen((RawSocketEvent event) {
-      //   if (event == RawSocketEvent.read) {
-      //     Datagram? dg = _udpSocket?.receive();
-      //     if (dg != null) {
-      //       debugPrint('Received from server: ${String.fromCharCodes(dg.data)}');
-      //     }
-      //   }
-      // });
-
 
       // --- Start flutter_sound recording ---
       StreamController<Uint8List>? recordingDataController = StreamController<Uint8List>();
       _recorderSubscription = recordingDataController.stream.listen(
             (Uint8List? buffer) {
           if (buffer != null && buffer.isNotEmpty && _udpSocket != null && _serverAddress != null && _serverPort != null) {
-            // Send data using UDP socket
             try {
-              _udpSocket?.send(buffer, _serverAddress!, _serverPort!);
-              // print('Sent ${buffer.length} bytes'); // Can be noisy
+              // --- Encryption Step ---
+              // 1. Generate a unique nonce for each packet
+              final nonce = encrypt.IV.fromSecureRandom(nonceLength); // 12 bytes for GCM
+
+              // 2. Encrypt the audio buffer
+              final encryptedData = encrypter.encryptBytes(buffer, iv: nonce);
+
+              // 3. Prepend nonce to ciphertext
+              final packetToSend = Uint8List.fromList(nonce.bytes + encryptedData.bytes);
+              // --- End Encryption Step ---
+
+              // 4. Send the combined packet (nonce + ciphertext)
+              _udpSocket?.send(packetToSend, _serverAddress!, _serverPort!);
+              // print('Sent ${packetToSend.length} encrypted bytes'); // Debug
+
             } catch (e) {
-              // Handle potential send errors (less common for UDP send itself)
-              debugPrint("Error sending UDP packet: $e");
-              // Optional: Implement some backoff or stop streaming
+              debugPrint("Error encrypting/sending UDP packet: $e");
+              // Consider stopping or adding error handling
             }
           }
         },
-        onError: (error) {
-          debugPrint("Recorder Stream Error: $error");
-          _handleStreamingError("Recorder Stream Error: $error");
-        },
-        onDone: () {
-          debugPrint("Recorder stream finished.");
-          if (_isStreaming) {
-            _handleStreamingError("Audio source finished unexpectedly.");
-          }
-        },
+        onError: (error) { debugPrint("Recorder Stream Error: $error"); _handleStreamingError("Recorder Stream Error: $error"); },
+        onDone: () { debugPrint("Recorder stream finished."); if (_isStreaming) { _handleStreamingError("Audio source finished unexpectedly."); } },
         cancelOnError: true,
       );
 
@@ -182,8 +165,8 @@ class _VoiceStreamerPageState extends State<VoiceStreamerPage> {
         sampleRate: serverSampleRate,
       );
 
-      setState(() { _statusText = "Streaming via UDP..."; });
-      debugPrint("Recording started to stream for UDP.");
+      setState(() { _statusText = "Streaming Encrypted via UDP..."; });
+      debugPrint("Recording started to stream for Encrypted UDP.");
 
     } catch (e) {
       debugPrint("UDP Socket/Start Error: $e");
@@ -191,6 +174,8 @@ class _VoiceStreamerPageState extends State<VoiceStreamerPage> {
     }
   }
 
+  // --- _stopStreaming, _handleStreamingError, build methods remain the same ---
+  // ... (paste the previous _stopStreaming, _handleStreamingError, build methods here) ...
   Future<void> _stopStreaming() async {
     if (!_isStreaming && _udpSocket == null && !_recorder.isRecording) {
       debugPrint("Stop called but not streaming/recording.");
@@ -246,12 +231,20 @@ class _VoiceStreamerPageState extends State<VoiceStreamerPage> {
   Widget build(BuildContext context) {
     // --- UI remains largely the same ---
     return Scaffold(
-      appBar: AppBar(title: const Text("Voice Streamer UDP (flutter_sound)")),
+      appBar: AppBar(title: const Text("Voice Streamer UDP Encrypted")), // Updated title
       body: Padding(
         padding: const EdgeInsets.all(16.0),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
+            // Add a small note about encryption maybe? (Optional)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 10.0),
+              child: Text(
+                "⚠️ Encryption active (Demo Key!)",
+                style: TextStyle(color: Colors.orange, fontWeight: FontWeight.bold),
+              ),
+            ),
             TextField(
               controller: _ipController,
               decoration: const InputDecoration(labelText: 'Server IP Address', border: OutlineInputBorder()),
@@ -288,4 +281,5 @@ class _VoiceStreamerPageState extends State<VoiceStreamerPage> {
       ),
     );
   }
+
 } // End of _VoiceStreamerPageState
