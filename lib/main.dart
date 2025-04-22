@@ -1,16 +1,12 @@
 import 'dart:async';
-import 'dart:io'; // For Socket
+import 'dart:io'; // For RawDatagramSocket, InternetAddress
 import 'dart:typed_data'; // For Uint8List
-// import 'package.flutter/foundation.dart'; // For kIsWeb
-// import 'package.flutter/material.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_sound/flutter_sound.dart';
 
-// Define the sample rate and number of channels expected by your server
-// Common values: 16000, 44100, 48000
+// Audio parameters (keep consistent)
 const int serverSampleRate = 16000;
-// 1 for mono, 2 for stereo
 const int serverNumChannels = 1;
 
 void main() {
@@ -19,15 +15,11 @@ void main() {
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Voice Streamer (flutter_sound)',
-      theme: ThemeData(
-        primarySwatch: Colors.blue,
-        useMaterial3: true,
-      ),
+      title: 'Voice Streamer UDP (flutter_sound)',
+      theme: ThemeData(primarySwatch: Colors.blue, useMaterial3: true),
       home: const VoiceStreamerPage(),
     );
   }
@@ -35,7 +27,6 @@ class MyApp extends StatelessWidget {
 
 class VoiceStreamerPage extends StatefulWidget {
   const VoiceStreamerPage({super.key});
-
   @override
   State<VoiceStreamerPage> createState() => _VoiceStreamerPageState();
 }
@@ -43,8 +34,11 @@ class VoiceStreamerPage extends StatefulWidget {
 class _VoiceStreamerPageState extends State<VoiceStreamerPage> {
   final FlutterSoundRecorder _recorder = FlutterSoundRecorder();
   StreamSubscription? _recorderSubscription;
-  StreamSubscription? _socketSubscription;
-  Socket? _socket;
+  // --- UDP Changes ---
+  RawDatagramSocket? _udpSocket; // Use RawDatagramSocket for UDP
+  InternetAddress? _serverAddress; // Store resolved server address
+  int? _serverPort; // Store server port
+  // --- End UDP Changes ---
 
   bool _isStreaming = false;
   bool _isRecorderInitialized = false;
@@ -53,7 +47,7 @@ class _VoiceStreamerPageState extends State<VoiceStreamerPage> {
   final TextEditingController _ipController =
   TextEditingController(text: "192.168.1.53"); // Default IP
   final TextEditingController _portController =
-  TextEditingController(text: "8080"); // Default Port
+  TextEditingController(text: "8080"); // Default Port (UDP)
 
   @override
   void initState() {
@@ -74,7 +68,7 @@ class _VoiceStreamerPageState extends State<VoiceStreamerPage> {
   @override
   void dispose() {
     _stopStreaming();
-    _recorder.closeRecorder().catchError((err){
+    _recorder.closeRecorder().catchError((err) {
       debugPrint("Error closing recorder: $err");
     });
     _ipController.dispose();
@@ -82,7 +76,6 @@ class _VoiceStreamerPageState extends State<VoiceStreamerPage> {
     super.dispose();
   }
 
-  // --- Recorder Session Management ---
   Future<void> _openRecorderSession() async {
     var micStatus = await Permission.microphone.request();
     if (micStatus != PermissionStatus.granted) {
@@ -93,134 +86,143 @@ class _VoiceStreamerPageState extends State<VoiceStreamerPage> {
     debugPrint("Recorder session opened.");
   }
 
-
-  // --- Streaming Logic ---
+  // --- UDP Streaming Logic ---
   Future<void> _startStreaming() async {
     if (_isStreaming) return;
     if (!_isRecorderInitialized) {
-      setState(() {
-        _statusText = "Recorder not initialized yet. Please wait or restart.";
-      });
+      setState(() { _statusText = "Recorder not ready."; });
       return;
     }
-
     var micStatus = await Permission.microphone.status;
     if (!micStatus.isGranted) {
-      setState(() { _statusText = "Microphone permission revoked."; });
+      setState(() { _statusText = "Microphone permission needed."; });
       return;
     }
 
-    final String ip = _ipController.text.trim();
+    final String ipStr = _ipController.text.trim();
     final String portStr = _portController.text.trim();
-    int? port = int.tryParse(portStr);
+    _serverPort = int.tryParse(portStr);
 
-    if (ip.isEmpty || port == null) {
+    if (ipStr.isEmpty || _serverPort == null) {
       setState(() { _statusText = "Invalid IP or Port"; });
       return;
     }
 
+    // Resolve IP address string to InternetAddress object
+    try {
+      var addresses = await InternetAddress.lookup(ipStr);
+      if (addresses.isEmpty) {
+        setState(() { _statusText = "Cannot resolve IP address"; });
+        return;
+      }
+      // Use the first resolved address
+      _serverAddress = addresses.first;
+      debugPrint('Resolved server address: ${_serverAddress?.address}');
+
+    } catch (e) {
+      setState(() { _statusText = "Error resolving IP: $e"; });
+      return;
+    }
+
+
     setState(() {
-      _statusText = "Connecting to $ip:$port...";
-      _isStreaming = true;
+      _statusText = "Starting UDP Stream...";
+      _isStreaming = true; // Tentatively set streaming state
     });
 
     try {
-      _socket = await Socket.connect(ip, port, timeout: const Duration(seconds: 5));
-      debugPrint("Connected to server: ${_socket?.remoteAddress.address}:${_socket?.remotePort}");
-      setState(() { _statusText = "Connected. Starting stream..."; });
+      // Bind the UDP socket to any available local IP and port 0 (OS chooses port)
+      _udpSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+      debugPrint('UDP Socket bound to local port: ${_udpSocket?.port}');
 
-      _socketSubscription = _socket?.listen(
-            (data) { debugPrint("Received from server: ${String.fromCharCodes(data)}"); },
+      // Optional: Listen for incoming datagrams (e.g., ACKs from server)
+      // _udpSocket?.listen((RawSocketEvent event) {
+      //   if (event == RawSocketEvent.read) {
+      //     Datagram? dg = _udpSocket?.receive();
+      //     if (dg != null) {
+      //       debugPrint('Received from server: ${String.fromCharCodes(dg.data)}');
+      //     }
+      //   }
+      // });
+
+
+      // --- Start flutter_sound recording ---
+      StreamController<Uint8List>? recordingDataController = StreamController<Uint8List>();
+      _recorderSubscription = recordingDataController.stream.listen(
+            (Uint8List? buffer) {
+          if (buffer != null && buffer.isNotEmpty && _udpSocket != null && _serverAddress != null && _serverPort != null) {
+            // Send data using UDP socket
+            try {
+              _udpSocket?.send(buffer, _serverAddress!, _serverPort!);
+              // print('Sent ${buffer.length} bytes'); // Can be noisy
+            } catch (e) {
+              // Handle potential send errors (less common for UDP send itself)
+              debugPrint("Error sending UDP packet: $e");
+              // Optional: Implement some backoff or stop streaming
+            }
+          }
+        },
         onError: (error) {
-          debugPrint("Socket Error: $error");
-          _handleStreamingError("Socket Error: $error");
+          debugPrint("Recorder Stream Error: $error");
+          _handleStreamingError("Recorder Stream Error: $error");
         },
         onDone: () {
-          debugPrint("Socket closed by server.");
-          _handleStreamingError("Server disconnected.");
+          debugPrint("Recorder stream finished.");
+          if (_isStreaming) {
+            _handleStreamingError("Audio source finished unexpectedly.");
+          }
         },
         cancelOnError: true,
       );
 
-      // --- Start flutter_sound recording to a Stream (Updated Part) ---
-      // 1. StreamController now handles nullable Uint8List directly
-      StreamController<Uint8List>? recordingDataController = StreamController<Uint8List>();
-
-      // 2. Listener now expects Uint8List? directly
-      _recorderSubscription = recordingDataController.stream.listen(
-              (Uint8List? buffer) { // Receive buffer directly
-            // 3. Check if the buffer is not null and not empty before sending
-            if (buffer != null && buffer.isNotEmpty) {
-              if (_socket != null) {
-                try {
-                  _socket?.add(buffer); // Send the buffer
-                } catch (e) {
-                  debugPrint("Error sending data: $e");
-                  _handleStreamingError("Error sending data: $e");
-                }
-              }
-            }
-          },
-          onError: (error){
-            debugPrint("Recorder Stream Error: $error");
-            _handleStreamingError("Recorder Stream Error: $error");
-          },
-          onDone: (){
-            debugPrint("Recorder stream finished.");
-            if (_isStreaming) {
-              _handleStreamingError("Audio source finished unexpectedly.");
-            }
-          },
-          cancelOnError: true
-      );
-
-      // Start recording
       await _recorder.startRecorder(
-        // 4. The sink type matches the StreamController (StreamSink<Uint8List?>)
         toStream: recordingDataController.sink,
-        codec: Codec.pcm16, // Raw 16-bit PCM audio
+        codec: Codec.pcm16,
         numChannels: serverNumChannels,
         sampleRate: serverSampleRate,
       );
 
-      setState(() { _statusText = "Streaming..."; });
-      debugPrint("Recording started to stream.");
+      setState(() { _statusText = "Streaming via UDP..."; });
+      debugPrint("Recording started to stream for UDP.");
 
     } catch (e) {
-      debugPrint("Connection or Start Error: $e");
-      _handleStreamingError("Failed to start: $e");
+      debugPrint("UDP Socket/Start Error: $e");
+      _handleStreamingError("Failed to start UDP: $e");
     }
   }
 
   Future<void> _stopStreaming() async {
-    if (!_isStreaming && _socket == null && _recorderSubscription == null && !_recorder.isRecording) {
+    if (!_isStreaming && _udpSocket == null && !_recorder.isRecording) {
       debugPrint("Stop called but not streaming/recording.");
       return;
     }
 
     setState(() { _statusText = "Stopping..."; });
 
+    // 1. Stop the recorder
     try {
       if (_recorder.isRecording) {
         await _recorder.stopRecorder();
         debugPrint("Recorder stopped.");
-      } else {
-        debugPrint("Recorder was not recording.");
       }
     } catch (err) {
       debugPrint('Error stopping recorder: $err');
     }
 
+    // 2. Cancel the recorder stream subscription
     await _recorderSubscription?.cancel();
     _recorderSubscription = null;
 
-    await _socketSubscription?.cancel();
-    _socketSubscription = null;
-    _socket?.close();
-    _socket = null;
-    debugPrint("Socket closed.");
+    // 3. Close the UDP socket
+    _udpSocket?.close();
+    _udpSocket = null;
+    debugPrint("UDP Socket closed.");
 
-    if(mounted) {
+    // Reset server address/port
+    _serverAddress = null;
+    _serverPort = null;
+
+    if (mounted) {
       setState(() {
         _isStreaming = false;
         _statusText = "Stream stopped. Enter Server IP/Port and press Start.";
@@ -230,22 +232,21 @@ class _VoiceStreamerPageState extends State<VoiceStreamerPage> {
 
   void _handleStreamingError(String errorMessage) {
     debugPrint("Streaming Error: $errorMessage");
-    if(mounted) {
+    if (mounted) {
       setState(() {
         _statusText = "Error: $errorMessage";
       });
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _stopStreaming();
+      _stopStreaming(); // Stop everything cleanly
     });
   }
 
   @override
   Widget build(BuildContext context) {
+    // --- UI remains largely the same ---
     return Scaffold(
-      appBar: AppBar(
-        title: const Text("Voice Streamer (flutter_sound)"),
-      ),
+      appBar: AppBar(title: const Text("Voice Streamer UDP (flutter_sound)")),
       body: Padding(
         padding: const EdgeInsets.all(16.0),
         child: Column(
@@ -253,26 +254,14 @@ class _VoiceStreamerPageState extends State<VoiceStreamerPage> {
           children: <Widget>[
             TextField(
               controller: _ipController,
-              decoration: const InputDecoration(
-                labelText: 'Server IP Address',
-                border: OutlineInputBorder(),
-              ),
-              onTapOutside: (_) {
-                FocusManager.instance.primaryFocus?.unfocus();
-              },
+              decoration: const InputDecoration(labelText: 'Server IP Address', border: OutlineInputBorder()),
               keyboardType: TextInputType.url,
               enabled: !_isStreaming,
             ),
             const SizedBox(height: 10),
             TextField(
               controller: _portController,
-              decoration: const InputDecoration(
-                labelText: 'Server Port',
-                border: OutlineInputBorder(),
-              ),
-              onTapOutside: (_) {
-                FocusManager.instance.primaryFocus?.unfocus();
-              },
+              decoration: const InputDecoration(labelText: 'Server Port (UDP)', border: OutlineInputBorder()),
               keyboardType: TextInputType.number,
               enabled: !_isStreaming,
             ),
@@ -291,18 +280,12 @@ class _VoiceStreamerPageState extends State<VoiceStreamerPage> {
               ),
             ),
             const SizedBox(height: 20),
-            Text(
-              _statusText,
-              textAlign: TextAlign.center,
-            ),
+            Text(_statusText, textAlign: TextAlign.center),
             if (!_isRecorderInitialized)
-              const Padding(
-                padding: EdgeInsets.only(top: 20.0),
-                child: CircularProgressIndicator(),
-              )
+              const Padding(padding: EdgeInsets.only(top: 20.0), child: CircularProgressIndicator())
           ],
         ),
       ),
     );
   }
-}
+} // End of _VoiceStreamerPageState
