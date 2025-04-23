@@ -1,111 +1,175 @@
 import socket
+import struct  # For packing/unpacking the length prefix
 import sounddevice as sd
 import numpy as np
-import queue # For potential buffering improvements later (optional)
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
+import threading  # Optional: To handle multiple clients, but keep simple for now
 
 # --- Configuration (MUST MATCH FLUTTER APP EXACTLY) ---
-HOST = '0.0.0.0'  # Listen on all interfaces
-PORT = 8080       # Port number (must match Flutter app)
-
-# Audio parameters from Flutter app (flutter_sound example)
-SAMPLE_RATE = 16000 # const int serverSampleRate = 16000;
-CHANNELS = 1        # const int serverNumChannels = 1; (Mono)
-# Codec.pcm16 sends signed 16-bit integers
-# Use 'int16' for numpy/sounddevice
+HOST = '0.0.0.0'
+PORT = 8080  # TCP Port
+SAMPLE_RATE = 16000
+CHANNELS = 1
 DTYPE = 'int16'
+RECV_BUFFER_SIZE = 4096  # Socket receive buffer size
 
-# Network buffer size (how much data to receive at once)
-# Should be appropriate for the data rate, 4096 is a common starting point
-BUFFER_SIZE = 4096
-# --- End Configuration ---
+# --- Encryption Setup (Keep the corrected 32-byte key) ---
+shared_key_bytes = b"ThisIsA_Secure32ByteKey12345678"  # Use the CORRECT 32-byte key
+NONCE_LENGTH = 12
+try:
+    aesgcm = AESGCM(shared_key_bytes)
+    print("AES-GCM cipher initialized successfully.")
+except ValueError as e:
+    print(f"Error initializing AESGCM: {e}")
+    exit()
+print("**************** WARNING: Using hardcoded demo key! ****************")
 
-print(f"Starting server on {HOST}:{PORT}...")
-print(f"Audio Settings: Sample Rate={SAMPLE_RATE}, Channels={CHANNELS}, Dtype={DTYPE}")
-print("Ensure the Flutter app is sending audio with these exact settings.")
 
-# --- Main Server Loop ---
-while True: # Loop to allow reconnects after client disconnects
-    conn = None # Define connection outside try block for cleanup
-    stream = None # Define stream outside try block for cleanup
+# --- End Encryption Setup ---
+
+# --- Helper Function to receive exact number of bytes ---
+def recvall(sock, n):
+    """Helper function to receive exactly n bytes from socket sock"""
+    data = bytearray()
+    while len(data) < n:
+        packet = sock.recv(n - len(data))
+        if not packet:
+            return None  # Connection closed
+        data.extend(packet)
+    return bytes(data)
+
+
+# --- Function to handle a single client connection ---
+def handle_client(conn, addr, audio_stream):
+    print(f"Handling connection from {addr}")
+    expected_len = -1
+    packet_buffer = b''
+
     try:
-        # --- Set up Socket ---
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Allow address reuse
-            s.bind((HOST, PORT))
-            s.listen()
-            print(f"\nServer listening on port {PORT}... Waiting for connection.")
+        while True:
+            # --- Read Framed Message ---
+            # 1. Read the 4-byte length prefix
+            len_bytes = recvall(conn, 4)
+            if not len_bytes:
+                print(f"Client {addr} disconnected while waiting for length.")
+                break  # Client closed connection
 
-            conn, addr = s.accept()
-            print(f"Connected by {addr}")
+            # 2. Unpack the length (using Big Endian as sent from Flutter)
+            expected_len = struct.unpack('>I', len_bytes)[
+                0]  # >I means big-endian unsigned int (4 bytes)
 
-            # --- Configure and Start Audio Output Stream ---
-            # The 'with' statement ensures the stream is properly closed
-            with sd.OutputStream(samplerate=SAMPLE_RATE,
-                                 channels=CHANNELS,
-                                 dtype=DTYPE) as stream:
+            # 3. Read the full packet (nonce + ciphertext)
+            packet = recvall(conn, expected_len)
+            if not packet:
+                print(
+                    f"Client {addr} disconnected while waiting for payload (expected {expected_len} bytes).")
+                break
 
-                print("Audio output stream started. Playing received audio...")
-                # stream.start() is called automatically by 'with' context
+            # --- Decryption ---
+            if len(packet) < NONCE_LENGTH:
+                print(f"Received packet too short ({len(packet)} bytes) from {addr}. Discarding.")
+                continue
 
-                while True:
-                    # --- Receive Data ---
-                    data = conn.recv(BUFFER_SIZE)
-                    if not data:
-                        print(f"Connection closed by {addr}")
-                        break # Exit inner loop for this client
+            nonce = packet[:NONCE_LENGTH]
+            ciphertext = packet[NONCE_LENGTH:]
 
-                    # --- Process and Play Audio ---
-                    try:
-                        # Ensure we have an even number of bytes for int16 conversion
-                        if len(data) % 2 != 0:
-                            print(f"Warning: Received odd number of bytes ({len(data)}). Discarding last byte.")
-                            data = data[:-1] # Truncate the last byte
+            try:
+                plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+            except InvalidTag:
+                print(f"Decryption failed (InvalidTag) from {addr}. Discarding packet.")
+                continue  # Discard invalid packet
+            except Exception as decrypt_err:
+                print(f"Error during decryption from {addr}: {decrypt_err}")
+                continue
 
-                        # Check if data is empty after potential truncation
-                        if not data:
-                            continue
+            # --- Play Audio ---
+            try:
+                if len(plaintext) % 2 != 0:  # Should be even for int16
+                    print(
+                        f"Warning: Decrypted odd bytes ({len(plaintext)}) from {addr}. Discarding.")
+                    continue
+                if not plaintext: continue
 
-                        # Convert the raw bytes into a NumPy array of the correct data type
-                        audio_chunk = np.frombuffer(data, dtype=np.int16)
+                audio_chunk = np.frombuffer(plaintext, dtype=np.int16)
+                audio_stream.write(audio_chunk)
 
-                        # Write the audio chunk to the output stream to play it
-                        stream.write(audio_chunk)
+                # --- Corrected block ---
+            except ValueError as ve:  # Handle potential numpy errors (e.g., frombuffer)
+                print(
+                    f"Value Error converting/playing decrypted audio (len {len(plaintext)}) from {addr}: {ve}")
+                continue  # Skip this problematic chunk
+            except Exception as audio_err:  # Handle other playback errors (e.g., sounddevice issues)
+                print(f"Error during audio playback for {addr}: {audio_err}")
+                continue  # Skip this problematic chunk
+            # --- End corrected block ---
 
-                        # Optional: Print status (can be noisy)
-                        # print(f"Played {len(audio_chunk)} samples ({len(data)} bytes)")
 
-                    except ValueError as ve:
-                        # Might happen if buffer size and dtype don't align perfectly,
-                        # or if received data is somehow corrupted.
-                        print(f"Value Error converting audio buffer (length {len(data)}): {ve}")
-                        continue # Skip this chunk
-                    except Exception as audio_err:
-                        print(f"Error processing/playing audio chunk: {audio_err}")
-                        # Depending on the error, you might want to 'break' or 'continue'
-                        continue
 
-    # --- Error Handling & Cleanup ---
+    except ConnectionResetError:
+        print(f"Connection reset by client {addr}")
+    except Exception as e:
+        print(f"Error handling client {addr}: {e}")
+    finally:
+        print(f"Closing connection from {addr}")
+        conn.close()
+
+
+# --- Main Server Setup ---
+def main():
+    # --- Initialize Audio Output Stream ---
+    audio_stream = None
+    try:
+        audio_stream = sd.OutputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE)
+        audio_stream.start()
+        print("Audio output stream started.")
+    except Exception as e:
+        print(f"Failed to initialize audio stream: {e}")
+        return  # Exit if audio fails
+
+    # --- Initialize TCP Socket ---
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server_socket.bind((HOST, PORT))
+        server_socket.listen()  # Start listening for incoming connections
+        print(f"TCP Server listening on {HOST}:{PORT}...")
     except socket.error as e:
-        print(f"Socket error: {e}")
-    except sd.PortAudioError as pae:
-        # Common errors: Invalid device, sample rate not supported, etc.
-        print(f"Sounddevice Error: {pae}")
-        print("Check your Mac's audio output device and the script's audio settings.")
-        break # Exit outer loop if audio device fails critically
+        print(f"Failed to bind/listen on socket: {e}")
+        if audio_stream: audio_stream.close()
+        return  # Exit if socket fails
+
+    # --- Accept Connections Loop ---
+    try:
+        while True:
+            try:
+                # Wait for and accept a new connection
+                client_conn, client_addr = server_socket.accept()
+                print(f"\nAccepted connection from {client_addr}")
+                # In a real server, you'd likely start a new thread or process here
+                # For simplicity, handle one client at a time sequentially
+                handle_client(client_conn, client_addr, audio_stream)
+
+            except socket.error as accept_err:
+                print(f"Error accepting connection: {accept_err}")
+                # Decide if error is fatal or if loop can continue
+
     except KeyboardInterrupt:
         print("\nServer shutting down (Ctrl+C pressed).")
-        break # Exit the outer loop
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"An unexpected error occurred in main loop: {e}")
     finally:
-        # Ensure resources are cleaned up
-        # The sd.OutputStream is closed automatically by the 'with' block
-        if conn:
-            conn.close()
-            print("Connection closed.")
-        print("Waiting for new connection...")
-        # Optional small delay before restarting listening loop
-        # import time
-        # time.sleep(1)
+        print("Closing server socket and audio stream...")
+        if server_socket: server_socket.close()
+        if audio_stream:
+            try:
+                audio_stream.stop()
+                audio_stream.close()
+                print("Audio stream stopped.")
+            except Exception as e:
+                print(f"Error stopping audio stream: {e}")
+        print("Server stopped.")
 
-print("Server stopped.")
+
+if __name__ == "__main__":
+    main()
